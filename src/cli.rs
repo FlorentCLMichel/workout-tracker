@@ -25,7 +25,7 @@ enum SpecialExercise {
 #[command(name = "workout-tracker")]
 #[command(
     about = "Local workout tracking: metrics, workouts, and per-exercise graphs (PNG).",
-    long_about = "All commands accept --db-path (default: workout_tracker.db).\n\
+    long_about = "All commands accept --db-path (default: workout_tracker.db) and --help.\n\
 \n\
 Examples:\n\
   workout-tracker --db-path ./my.db init-db\n\
