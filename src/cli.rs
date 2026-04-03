@@ -23,10 +23,19 @@ enum SpecialExercise {
 
 #[derive(Parser, Debug)]
 #[command(name = "workout-tracker")]
-#[command(about = "Local workout tracking with daily graphs", long_about = None)]
+#[command(
+    about = "Local workout tracking: metrics, workouts, and per-exercise graphs (PNG).",
+    long_about = "All commands accept --db-path (default: workout_tracker.db).\n\
+\n\
+Examples:\n\
+  workout-tracker --db-path ./my.db init-db\n\
+  workout-tracker start-workout\n\
+  workout-tracker query-exercise --name \"Bench Press\" --kind reps --output-dir ./out\n\
+  workout-tracker query-exercise --name run --cutoff 2026-01-01 --min-distance 5 --max-distance 10 --output-dir ./out"
+)]
 pub struct Cli {
-    /// Path to the local SQLite database file.
-    #[arg(long, default_value = "workout_tracker.db")]
+    /// SQLite database file path (created on first use).
+    #[arg(long, default_value = "workout_tracker.db", global = true)]
     pub db_path: PathBuf,
 
     #[command(subcommand)]
@@ -69,16 +78,31 @@ pub enum Command {
     /// This is the “convenient” v1 interface while we keep JSON import as v0.
     StartWorkout,
 
-    /// Query an exercise and output two graphs as PNG files.
+    /// Query an exercise and write graph PNGs (reps/time or cardio metrics).
+    ///
+    /// **Reps / time-under-tension exercises:** uses `--kind` (reps or tension-seconds). Produces total_* and max_* PNGs.
+    ///
+    /// **Cardio (Running, Walking, Cycling, Swimming):** ignores `--kind`; produces distance / elevation / speed (and for swimming, time) PNGs. Optional `--min-distance` / `--max-distance` filter sessions by stored distance (km for run/walk/cycle, meters for swim).
+    ///
+    /// **Date range:** optional `--cutoff` is the earliest day to include (inclusive); all later days are included. If omitted, the range starts at the first workout day in the DB.
     QueryExercise {
-        #[arg(long)]
+        /// Exercise name (normalized: case/spaces/dashes ignored). Aliases: run→running, walk→walking, bike→cycling, swim→swimming.
+        #[arg(long, value_name = "NAME")]
         name: String,
-        /// Example: `2026-01-15` or `2026-01-15T10:30:00Z`
-        #[arg(long)]
+        /// Earliest day to include (inclusive); `YYYY-MM-DD` or RFC3339 (UTC). Later days are not capped. Omit to start at the first workout day in the DB.
+        #[arg(long, value_name = "DATE_OR_DATETIME")]
         cutoff: Option<String>,
-        #[arg(long, value_enum, default_value = "reps")]
+        /// For non-cardio exercises only: aggregate reps or time-under-tension (seconds) per day. Ignored for Running/Walking/Cycling/Swimming.
+        #[arg(long, value_enum, default_value = "reps", value_name = "KIND")]
         kind: KindArg,
-        #[arg(long, default_value = ".")]
+        /// Cardio only: include sessions where distance is >= this (km for run/walk/cycle, m for swim). Requires non-null distance in DB.
+        #[arg(long, value_name = "KM_OR_M")]
+        min_distance: Option<f64>,
+        /// Cardio only: include sessions where distance is <= this (same units as `--min-distance`).
+        #[arg(long, value_name = "KM_OR_M")]
+        max_distance: Option<f64>,
+        /// Directory for generated PNG files (created if missing).
+        #[arg(long, default_value = ".", value_name = "DIR")]
         output_dir: PathBuf,
     },
 }
@@ -370,20 +394,46 @@ pub fn run() -> Result<()> {
             tx.commit().context("failed to commit sqlite transaction")?;
             println!("Workout inserted (interactive)");
         }
-        Command::QueryExercise { name, cutoff, kind, output_dir } => {
+        Command::QueryExercise {
+            name,
+            cutoff,
+            kind,
+            output_dir,
+            min_distance,
+            max_distance,
+        } => {
             db.init_schema()?; // safe for existing DB
 
             let (canonical_query_name, _) = canonicalize_exercise_name_for_entry(&name);
             let normalized_name = crate::models::normalize_exercise_name(&canonical_query_name);
             let special = special_from_normalized_name(&normalized_name);
 
+            if (min_distance.is_some() || max_distance.is_some()) && special.is_none() {
+                anyhow::bail!(
+                    "--min-distance / --max-distance only apply to Running, Walking, Cycling, and Swimming"
+                );
+            }
+            if let (Some(lo), Some(hi)) = (min_distance, max_distance) {
+                if lo > hi {
+                    anyhow::bail!("--min-distance ({lo}) must be <= --max-distance ({hi})");
+                }
+            }
+
             let cutoff_dt: Option<DateTime<Utc>> = match cutoff {
                 Some(s) => Some(parse_iso_utc_datetime(&s)?),
                 None => None,
             };
 
+            let cardio_suffix = cardio_distance_filter_suffix(min_distance, max_distance);
+
             if let Some(special) = special {
-                let points = query_cardio_daily_points(&db, &normalized_name, cutoff_dt)?;
+                let points = query_cardio_daily_points(
+                    &db,
+                    &normalized_name,
+                    cutoff_dt,
+                    min_distance,
+                    max_distance,
+                )?;
                 if points.is_empty() {
                     println!("No data for exercise '{name}'");
                     return Ok(());
@@ -399,9 +449,9 @@ pub fn run() -> Result<()> {
                         if !distance_points.is_empty() {
                             let path = graphs::plot_single_metric_png(
                                 &distance_points,
-                                &format!("{name} distance per day"),
+                                &cardio_plot_title(&name, "distance per day", min_distance, max_distance),
                                 "distance (km)",
-                                &format!("distance_{normalized_name}.png"),
+                                &format!("distance_{normalized_name}{cardio_suffix}.png"),
                                 &output_dir,
                             )?;
                             created.push(path);
@@ -414,9 +464,9 @@ pub fn run() -> Result<()> {
                         if !elevation_points.is_empty() {
                             let path = graphs::plot_single_metric_png(
                                 &elevation_points,
-                                &format!("{name} elevation per day"),
+                                &cardio_plot_title(&name, "elevation per day", min_distance, max_distance),
                                 "elevation (m)",
-                                &format!("elevation_{normalized_name}.png"),
+                                &format!("elevation_{normalized_name}{cardio_suffix}.png"),
                                 &output_dir,
                             )?;
                             created.push(path);
@@ -429,9 +479,9 @@ pub fn run() -> Result<()> {
                         if !speed_points.is_empty() {
                             let path = graphs::plot_single_metric_png(
                                 &speed_points,
-                                &format!("{name} average speed per day"),
+                                &cardio_plot_title(&name, "average speed per day", min_distance, max_distance),
                                 "avg speed (km/h)",
-                                &format!("avg_speed_{normalized_name}.png"),
+                                &format!("avg_speed_{normalized_name}{cardio_suffix}.png"),
                                 &output_dir,
                             )?;
                             created.push(path);
@@ -445,9 +495,9 @@ pub fn run() -> Result<()> {
                         if !distance_points.is_empty() {
                             let path = graphs::plot_single_metric_png(
                                 &distance_points,
-                                &format!("{name} distance per day"),
+                                &cardio_plot_title(&name, "distance per day", min_distance, max_distance),
                                 "distance (m)",
-                                &format!("distance_{normalized_name}.png"),
+                                &format!("distance_{normalized_name}{cardio_suffix}.png"),
                                 &output_dir,
                             )?;
                             created.push(path);
@@ -460,9 +510,9 @@ pub fn run() -> Result<()> {
                         if !duration_points.is_empty() {
                             let path = graphs::plot_single_metric_png(
                                 &duration_points,
-                                &format!("{name} time per day"),
+                                &cardio_plot_title(&name, "time per day", min_distance, max_distance),
                                 "time (s)",
-                                &format!("time_{normalized_name}.png"),
+                                &format!("time_{normalized_name}{cardio_suffix}.png"),
                                 &output_dir,
                             )?;
                             created.push(path);
@@ -608,6 +658,25 @@ fn canonicalize_exercise_name_for_entry(user_input: &str) -> (String, Option<Spe
         "bike" | "cycling" => ("Cycling".to_string(), Some(SpecialExercise::Cycling)),
         "swim" | "swimming" => ("Swimming".to_string(), Some(SpecialExercise::Swimming)),
         _ => (user_input.trim().to_string(), None),
+    }
+}
+
+fn cardio_distance_filter_suffix(min: Option<f64>, max: Option<f64>) -> String {
+    match (min, max) {
+        (None, None) => String::new(),
+        (Some(a), None) => format!("_mind{a}"),
+        (None, Some(b)) => format!("_maxd{b}"),
+        (Some(a), Some(b)) => format!("_d{a}_{b}"),
+    }
+}
+
+fn cardio_plot_title(name: &str, metric: &str, min: Option<f64>, max: Option<f64>) -> String {
+    let base = format!("{name} {metric}");
+    match (min, max) {
+        (None, None) => base,
+        (Some(a), None) => format!("{base} (distance >= {a})"),
+        (None, Some(b)) => format!("{base} (distance <= {b})"),
+        (Some(a), Some(b)) => format!("{base} ({a} <= distance <= {b})"),
     }
 }
 

@@ -69,11 +69,14 @@ pub fn query_cardio_daily_points(
     db: &Db,
     exercise_name: &str,
     cutoff_start: Option<DateTime<Utc>>,
+    min_distance: Option<f64>,
+    max_distance: Option<f64>,
 ) -> anyhow::Result<Vec<DailyCardioPoint>> {
     let cutoff_day = resolve_cutoff_day(db, cutoff_start)?;
     let cutoff_day_str = cutoff_day.format("%Y-%m-%d").to_string();
 
-    let sql = r#"
+    let sql = match (min_distance, max_distance) {
+        (None, None) => r#"
         SELECT
           DATE(w.performed_at) AS day,
           SUM(we.distance)     AS distance_sum,
@@ -87,10 +90,68 @@ pub fn query_cardio_daily_points(
           AND DATE(w.performed_at) >= ?2
         GROUP BY DATE(w.performed_at)
         ORDER BY DATE(w.performed_at) ASC
-    "#;
+        "#,
+        (Some(_min_d), None) => r#"
+        SELECT
+          DATE(w.performed_at) AS day,
+          SUM(we.distance)     AS distance_sum,
+          SUM(we.elevation)    AS elevation_sum,
+          AVG(we.avg_speed)    AS avg_speed_avg,
+          SUM(we.duration_seconds) AS duration_sum
+        FROM workouts w
+        JOIN workout_exercises we
+          ON we.workout_id = w.id
+        WHERE we.exercise_name = ?1
+          AND DATE(w.performed_at) >= ?2
+          AND we.distance IS NOT NULL
+          AND we.distance >= ?3
+        GROUP BY DATE(w.performed_at)
+        ORDER BY DATE(w.performed_at) ASC
+        "#,
+        (None, Some(_max_d)) => r#"
+        SELECT
+          DATE(w.performed_at) AS day,
+          SUM(we.distance)     AS distance_sum,
+          SUM(we.elevation)    AS elevation_sum,
+          AVG(we.avg_speed)    AS avg_speed_avg,
+          SUM(we.duration_seconds) AS duration_sum
+        FROM workouts w
+        JOIN workout_exercises we
+          ON we.workout_id = w.id
+        WHERE we.exercise_name = ?1
+          AND DATE(w.performed_at) >= ?2
+          AND we.distance IS NOT NULL
+          AND we.distance <= ?3
+        GROUP BY DATE(w.performed_at)
+        ORDER BY DATE(w.performed_at) ASC
+        "#,
+        (Some(_min_d), Some(_max_d)) => r#"
+        SELECT
+          DATE(w.performed_at) AS day,
+          SUM(we.distance)     AS distance_sum,
+          SUM(we.elevation)    AS elevation_sum,
+          AVG(we.avg_speed)    AS avg_speed_avg,
+          SUM(we.duration_seconds) AS duration_sum
+        FROM workouts w
+        JOIN workout_exercises we
+          ON we.workout_id = w.id
+        WHERE we.exercise_name = ?1
+          AND DATE(w.performed_at) >= ?2
+          AND we.distance IS NOT NULL
+          AND we.distance >= ?3
+          AND we.distance <= ?4
+        GROUP BY DATE(w.performed_at)
+        ORDER BY DATE(w.performed_at) ASC
+        "#,
+    };
 
     let mut stmt = db.conn.prepare(sql)?;
-    let mut rows = stmt.query(params![exercise_name, cutoff_day_str])?;
+    let mut rows = match (min_distance, max_distance) {
+        (None, None) => stmt.query(params![exercise_name, cutoff_day_str])?,
+        (Some(min_d), None) => stmt.query(params![exercise_name, cutoff_day_str, min_d])?,
+        (None, Some(max_d)) => stmt.query(params![exercise_name, cutoff_day_str, max_d])?,
+        (Some(min_d), Some(max_d)) => stmt.query(params![exercise_name, cutoff_day_str, min_d, max_d])?,
+    };
 
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
