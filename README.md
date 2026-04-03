@@ -236,8 +236,7 @@ workout-tracker/
 │   ├── queries.rs      # Database queries
 │   └── lib.rs         # Module exports
 ├── Cargo.toml         # Dependencies
-├── Makefile           # Build tasks
-└── NEXT_STEPS.md      # Development roadmap
+└── Makefile           # Build tasks
 ```
 
 ### Dependencies
@@ -313,7 +312,3 @@ A: Simply copy the SQLite database file (default: workout_tracker.db) to a safe 
 ### Q: Can I use this on multiple devices?
 
 A: The application uses a local SQLite database, so you would need to manually sync the database file between devices.
-
-## Roadmap
-
-The NEXT_STEPS.md file contains detailed information about planned features and development milestones.
