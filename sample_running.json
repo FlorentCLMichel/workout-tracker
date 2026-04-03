@@ -1,0 +1,13 @@
+{
+  "performed_at": "2026-02-01T08:00:00Z",
+  "circuit": false,
+  "exercises": [
+    {
+      "name": "Running",
+      "distance": 7.2,
+      "elevation": 180,
+      "avg_speed": 10.5,
+      "sets": []
+    }
+  ]
+}
